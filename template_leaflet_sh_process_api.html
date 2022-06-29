@@ -1,0 +1,181 @@
+<html>
+<head>
+  <style>
+    #map{
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"
+    integrity="sha512-xodZBNTC5n17Xt2atTPuE1HxjVMSvLVW9ocqUKLsCC5CXdbqCmblAshOMAS6/keqq/sMZMZ19scR4PsZChSR7A=="
+    crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"
+    integrity="sha512-XQoYMqMTK8LvdxXYG3nZ448hOEQiglfqkJs1NOQV44cWnUrBc8PkAOcXy20w0vlaXaVUearIOBhiXZ5V3ynxwA=="
+    crossorigin=""></script>
+</head>
+</body>
+
+<div id="map"></div>
+
+<script>
+  /************************* 
+  
+   Sentinel Hub OAuth2 + Process API Leaflet
+
+  How to use:
+
+    1) enter Sentinel Hub client ID and secret
+      (go to SH Dashboard -> User settings -> OAuth clients -> "+")
+
+    2) open this file in browser
+
+  *************************/
+  const CLIENT_ID = "YOUR_CLIENT_ID";
+  const CLIENT_SECRET = "YOUR_CLIENT_SECRET";
+
+  const fromDate = "2020-07-01T00:00:00.000Z";
+  const toDate = "2020-09-01T00:00:00.000Z";
+  const dataset = "S2L1C";
+
+  const S2L2ATrueColorScript = `//VERSION=3
+    //TRUE COLOR
+
+    let minVal = 0.0;
+    let maxVal = 0.4;
+
+    let viz = new HighlightCompressVisualizer(minVal, maxVal);
+
+    function evaluatePixel(samples) {
+      let val = [samples.B04, samples.B03, samples.B02];
+      val = viz.processList(val);
+      val.push(samples.dataMask);
+      return val;
+    }
+
+    function setup() {
+      return {
+        input: [{ bands: [ "B02", "B03", "B04", "dataMask" ]}],
+        output: { bands: 4 }
+      }
+    }
+  `;
+
+  // Promise which will fetch Sentinel Hub authentication token:
+  const authTokenPromise = fetch(
+    "https://services.sentinel-hub.com/oauth/token",
+    {
+      method: "post",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=client_credentials&client_id=${encodeURIComponent(
+        CLIENT_ID
+      )}&client_secret=${encodeURIComponent(CLIENT_SECRET)}`,
+    }
+  )
+  .then((response) => response.json())
+  .then((auth) => auth["access_token"]);
+
+  // We need to extend Leaflet's GridLayer to add support for loading images through
+  // Sentinel Hub Process API:
+  L.GridLayer.SHProcessLayer = L.GridLayer.extend({
+    createTile: function (coords, done) {
+      const tile = L.DomUtil.create("img", "leaflet-tile");
+      const tileSize = this.options.tileSize;
+      tile.width = tileSize;
+      tile.height = tileSize;
+      const nwPoint = coords.multiplyBy(tileSize);
+      const sePoint = nwPoint.add([tileSize, tileSize]);
+      const nw = L.CRS.EPSG4326.project(
+        this._map.unproject(nwPoint, coords.z)
+      );
+      const se = L.CRS.EPSG4326.project(
+        this._map.unproject(sePoint, coords.z)
+      );
+
+      authTokenPromise.then((authToken) => {
+        // Construct Process API request payload:
+        //   https://docs.sentinel-hub.com/api/latest/reference/#tag/process
+        const payload = {
+          input: {
+            bounds: {
+              bbox: [nw.x, nw.y, se.x, se.y],
+              properties: {
+                crs: "http://www.opengis.net/def/crs/EPSG/0/4326",
+              },
+            },
+            data: [
+              {
+                dataFilter: {
+                  timeRange: { from: fromDate, to: toDate },
+                  maxCloudCoverage: 10,
+                  mosaickingOrder: "mostRecent",    
+                },
+                processing: {},
+                type: dataset,
+              },
+            ],
+          },
+          output: {
+            width: 512,
+            height: 512,
+            responses: [
+              {
+                identifier: "default",
+                format: { type: "image/png" },
+              },
+            ],
+          },
+          evalscript: this.options.evalscript,
+        };
+
+        // Fetch the image:
+        fetch("https://services.sentinel-hub.com/api/v1/process", {
+          method: "post",
+          headers: {
+            Authorization: "Bearer " + authToken,
+            "Content-Type": "application/json",
+            Accept: "*/*",
+          },
+          body: JSON.stringify(payload),
+        })
+        .then((response) => response.blob())
+        .then((blob) => {
+            const objectURL = URL.createObjectURL(blob);
+            tile.onload = () => {
+                URL.revokeObjectURL(objectURL);
+                done(null, tile);
+            };
+            tile.src = objectURL;
+        })
+        .catch((err) => done(err, null));
+      });
+      return tile;
+    },
+  });
+
+  L.gridLayer.shProcessLayer = function (opts) {
+    return new L.GridLayer.SHProcessLayer(opts);
+  };
+
+  const S2L2ATrueColorLayer = L.gridLayer.shProcessLayer({evalscript: S2L2ATrueColorScript});
+    
+  let osm = L.tileLayer("http://{s}.tile.osm.org/{z}/{x}/{y}.png", {
+    attribution: '&copy; <a href="http://osm.org/copyright">OpenStreetMap</a> contributors'
+  });
+
+  // configure Leaflet:
+  let baseMaps = {
+    OpenStreetMap: osm,
+  };
+  let overlayMaps = {
+    "True": S2L2ATrueColorLayer,
+  };
+
+  let map = L.map("map", {
+    center: [39.243276, 37.042575],
+    zoom: 15,
+    layers: [osm, S2L2ATrueColorLayer],
+  });
+  L.control.layers(baseMaps, overlayMaps).addTo(map);
+</script>
+</body>
+</html>
